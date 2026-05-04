@@ -4,6 +4,7 @@ Compatible with openai-whisper-asr-webservice API endpoints
 """
 
 import os
+import time
 import tempfile
 import logging
 import warnings
@@ -11,7 +12,7 @@ from typing import Optional
 from pathlib import Path
 
 from fastapi import FastAPI, File, UploadFile, Query, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 import whisperx
 
 from app.version import __version__
@@ -30,6 +31,7 @@ from app.pipeline import (
     _whisper_models as loaded_models,
 )
 from app.queue import run_in_queue, get_queue_metrics
+from app import metrics as prom_metrics
 
 # Suppress pyannote pooling warnings about degrees of freedom
 warnings.filterwarnings("ignore", message=".*degrees of freedom is <= 0.*")
@@ -59,6 +61,12 @@ logger.info(f"Default model: {DEFAULT_MODEL}, Serve mode: {SERVE_MODE}")
 @app.on_event("startup")
 async def startup_event():
     """Preload models on startup"""
+    prom_metrics.SERVICE_INFO.info({
+        "version": __version__,
+        "device": DEVICE,
+        "compute_type": COMPUTE_TYPE,
+        "serve_mode": SERVE_MODE,
+    })
     preload_model = os.getenv("PRELOAD_MODEL", None)
     if preload_model:
         logger.info(f"Preloading model on startup: {preload_model}")
@@ -118,6 +126,9 @@ async def transcribe_audio(
         return_speaker_embeddings: Return speaker embeddings (256-dimensional vectors)
     """
     temp_audio_path = None
+    request_started = time.time()
+    metric_status = "error"
+    prom_metrics.ACTIVE_TRANSCRIPTIONS.inc()
 
     try:
         # Handle legacy parameter names
@@ -145,6 +156,7 @@ async def transcribe_audio(
 
         # Check file size
         file_size_mb = len(content) / (1024 * 1024)
+        prom_metrics.AUDIO_SIZE_MB.observe(file_size_mb)
         if file_size_mb > MAX_FILE_SIZE_MB:
             raise HTTPException(
                 status_code=413,
@@ -159,6 +171,7 @@ async def transcribe_audio(
 
         # Load audio
         audio = whisperx.load_audio(temp_audio_path)
+        prom_metrics.AUDIO_DURATION.observe(len(audio) / 16000.0)
 
         # Run pipeline through the async queue (GPU semaphore)
         result, speaker_embeddings = await run_in_queue(
@@ -192,10 +205,12 @@ async def transcribe_audio(
                 response_data["speaker_embeddings"] = sanitize_float_values(speaker_embeddings)
                 logger.info(f"Including speaker embeddings in response: {list(speaker_embeddings.keys())}")
 
+            metric_status = "ok"
             return JSONResponse(content=response_data)
 
         elif output_format == "text":
             text = " ".join([seg.get("text", "") for seg in result.get("segments", [])])
+            metric_status = "ok"
             return {"text": text}
 
         elif output_format == "srt":
@@ -211,6 +226,7 @@ async def transcribe_audio(
 
                 srt_content.append(f"{i}\n{start_time} --> {end_time}\n{text}\n")
 
+            metric_status = "ok"
             return {"srt": "\n".join(srt_content)}
 
         elif output_format == "vtt":
@@ -226,6 +242,7 @@ async def transcribe_audio(
 
                 vtt_content.append(f"{start_time} --> {end_time}\n{text}\n")
 
+            metric_status = "ok"
             return {"vtt": "\n".join(vtt_content)}
 
         elif output_format == "tsv":
@@ -237,16 +254,24 @@ async def transcribe_audio(
                 speaker = segment.get("speaker", "")
                 tsv_content.append(f"{start}\t{end}\t{text}\t{speaker}")
 
+            metric_status = "ok"
             return {"tsv": "\n".join(tsv_content)}
 
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported output format: {output_format}")
 
+    except HTTPException as e:
+        metric_status = f"http_{e.status_code}"
+        raise
     except Exception as e:
         logger.error(f"Transcription error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
+        prom_metrics.ACTIVE_TRANSCRIPTIONS.dec()
+        prom_metrics.REQUEST_DURATION.labels(endpoint="/asr").observe(time.time() - request_started)
+        prom_metrics.REQUESTS_TOTAL.labels(endpoint="/asr", status=metric_status).inc()
+        prom_metrics.refresh_vram()
         if temp_audio_path and os.path.exists(temp_audio_path):
             try:
                 os.unlink(temp_audio_path)
@@ -267,7 +292,16 @@ async def health_check():
 
 @app.get("/metrics")
 async def metrics():
-    """Queue and pipeline metrics"""
+    """Prometheus metrics in OpenMetrics text format."""
+    prom_metrics.LOADED_MODELS.set(len(loaded_models))
+    prom_metrics.refresh_vram()
+    body, content_type = prom_metrics.render()
+    return Response(content=body, media_type=content_type)
+
+
+@app.get("/queue-metrics")
+async def queue_metrics():
+    """Queue and pipeline state (JSON; the old /metrics shape)."""
     data = {
         "serve_mode": SERVE_MODE,
         "device": DEVICE,

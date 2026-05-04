@@ -11,6 +11,7 @@ Start with:
 """
 
 import os
+import time
 import logging
 import tempfile
 import warnings
@@ -18,7 +19,7 @@ from typing import Optional, List
 from pathlib import Path
 
 from fastapi import FastAPI, File, UploadFile, Form, Query, HTTPException, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 import whisperx
 from ray import serve
 
@@ -34,6 +35,7 @@ from app.pipeline import (
     get_canonical_models,
     _whisper_models as loaded_models,
 )
+from app import metrics as prom_metrics
 from app.schemas import (
     ResponseFormat,
     TranscriptionWord,
@@ -119,6 +121,12 @@ class ASRIngress:
         self._whisper = whisper_handle
         self._align = align_handle
         self._diarize = diarize_handle
+        prom_metrics.SERVICE_INFO.info({
+            "version": __version__,
+            "device": DEVICE,
+            "compute_type": COMPUTE_TYPE,
+            "serve_mode": "ray",
+        })
 
     # ------------------------------------------------------------------
     # Basic endpoints
@@ -144,6 +152,21 @@ class ASRIngress:
 
     @fastapi_app.get("/metrics")
     async def metrics(self):
+        """Prometheus metrics in OpenMetrics text format.
+
+        Note: in Ray Serve mode this only reflects the ingress process. Whisper
+        models load inside replica processes, so whisperx_loaded_models and
+        whisperx_vram_allocated_bytes will read 0 here. HTTP-level counters
+        (requests, durations, audio sizes) are accurate.
+        """
+        prom_metrics.LOADED_MODELS.set(len(loaded_models))
+        prom_metrics.refresh_vram()
+        body, content_type = prom_metrics.render()
+        return Response(content=body, media_type=content_type)
+
+    @fastapi_app.get("/queue-metrics")
+    async def queue_metrics(self):
+        """Pipeline state (JSON; the old /metrics shape)."""
         return {
             "serve_mode": "ray",
             "device": DEVICE,
@@ -173,6 +196,9 @@ class ASRIngress:
         return_speaker_embeddings: Optional[bool] = Query(None),
     ):
         temp_audio_path = None
+        request_started = time.time()
+        metric_status = "error"
+        prom_metrics.ACTIVE_TRANSCRIPTIONS.inc()
         try:
             if output is not None:
                 output_format = output
@@ -195,6 +221,7 @@ class ASRIngress:
                 temp_file.write(content)
 
             file_size_mb = len(content) / (1024 * 1024)
+            prom_metrics.AUDIO_SIZE_MB.observe(file_size_mb)
             if file_size_mb > MAX_FILE_SIZE_MB:
                 raise HTTPException(
                     status_code=413,
@@ -203,6 +230,7 @@ class ASRIngress:
 
             logger.info(f"Processing {audio_file.filename} ({file_size_mb:.1f}MB), model: {model}")
             audio = whisperx.load_audio(temp_audio_path)
+            prom_metrics.AUDIO_DURATION.observe(len(audio) / 16000.0)
 
             if self._pipeline:
                 result, speaker_embeddings = await self._pipeline.run.remote(
@@ -233,15 +261,23 @@ class ASRIngress:
                     )
 
             detected_language = result.get("language", language or "en")
+            metric_status = "ok"
             return self._format_asr_response(
                 result, detected_language, output_format,
                 return_speaker_embeddings, speaker_embeddings,
             )
 
+        except HTTPException as e:
+            metric_status = f"http_{e.status_code}"
+            raise
         except Exception as e:
             logger.error(f"Transcription error: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
         finally:
+            prom_metrics.ACTIVE_TRANSCRIPTIONS.dec()
+            prom_metrics.REQUEST_DURATION.labels(endpoint="/asr").observe(time.time() - request_started)
+            prom_metrics.REQUESTS_TOTAL.labels(endpoint="/asr", status=metric_status).inc()
+            prom_metrics.refresh_vram()
             if temp_audio_path and os.path.exists(temp_audio_path):
                 try:
                     os.unlink(temp_audio_path)
