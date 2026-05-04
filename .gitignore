@@ -57,6 +57,7 @@ docker-compose.dev.local.yml
 
 # Local notes
 notes.md
+CLAUDE_NOTES.md
 
 # Temporary files
 temp/
